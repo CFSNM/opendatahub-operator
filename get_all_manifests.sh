@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
+
 GITHUB_URL="https://github.com"
 
 # COMPONENT_MANIFESTS is a list of components repositories info to fetch the manifests
