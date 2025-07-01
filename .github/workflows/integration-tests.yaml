@@ -1,12 +1,6 @@
 name: Integration tests
-on: {}
-#  pull_request_target:
-#    paths:
-#      - 'bundle/**'
-#      - 'config/**'
-#      - 'internal/**'
-#      - 'pkg/**'
-#      - 'cmd/main.go'
+on:
+  pull_request_target:
 
 permissions: {}
 
