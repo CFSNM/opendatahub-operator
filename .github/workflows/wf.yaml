@@ -23,7 +23,7 @@ jobs:
 
       - name: Update main commits into rhoai
         id: update_main_into_rhoai
-        run: git config --global user.email "csannico@redhat.com" && git config --global user.name "CFSNM" && git fetch origin main rhoai && git merge -s ours origin/main
+        run: git remote set-url origin git@github.com:CFSNM/opendatahub-operator.git && git config --global user.email "csannico@redhat.com" && git config --global user.name "CFSNM" && git fetch origin main rhoai && git merge -s ours origin/main
 
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v7
