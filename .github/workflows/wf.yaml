@@ -25,7 +25,7 @@ jobs:
         uses: peter-evans/create-pull-request@v7
         id: create-pr
         with:
-          token: "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"
+          token: "${{ secrets.GH_TOKEN }}"
           commit-message: "[sync]: sync main into rhoai"
           title: "[sync]: sync main into rhoai"
           body: |
