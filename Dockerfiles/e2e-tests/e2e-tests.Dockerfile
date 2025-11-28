@@ -29,10 +29,10 @@ RUN CGO_ENABLED=${CGO_ENABLED} GOOS=linux GOARCH=${TARGETARCH} go test -c ./test
 FROM golang:$GOLANG_VERSION
 
 # ENV vars
-ENV E2E_TEST_OPERATOR_NAMESPACE=redhat-ods-operator
-ENV E2E_TEST_APPLICATIONS_NAMESPACE=redhat-ods-applications
-ENV E2E_TEST_WORKBENCHES_NAMESPACE=rhods-notebooks
-ENV E2E_TEST_MONITORING_NAMESPACE=redhat-ods-monitoring
+ENV E2E_TEST_OPERATOR_NAMESPACE=opendatahub-operators
+ENV E2E_TEST_APPLICATIONS_NAMESPACE=opendatahub
+ENV E2E_TEST_WORKBENCHES_NAMESPACE=opendatahub
+ENV E2E_TEST_DSC_MONITORING_NAMESPACE=opendatahub
 
 RUN apt-get update -y && \
     curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
@@ -55,4 +55,4 @@ RUN mkdir -p results
 CMD gotestsum --junitfile-project-name odh-operator-e2e --junitfile results/xunit_report.xml --format testname --raw-command \
 -- test2json -p e2e ./e2e-tests --test.parallel=1 --test.v=test2json --deletion-policy=never \
 --operator-namespace=$E2E_TEST_OPERATOR_NAMESPACE --applications-namespace=$E2E_TEST_APPLICATIONS_NAMESPACE \
---workbenches-namespace=$E2E_TEST_WORKBENCHES_NAMESPACE --dsc-monitoring-namespace=$E2E_TEST_MONITORING_NAMESPACE
+--workbenches-namespace=$E2E_TEST_WORKBENCHES_NAMESPACE --dsc-monitoring-namespace=$E2E_TEST_DSC_MONITORING_NAMESPACE
