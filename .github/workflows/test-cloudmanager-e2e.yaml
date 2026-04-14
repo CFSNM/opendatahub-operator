@@ -8,10 +8,6 @@ on:
 permissions:
   contents: read
 
-env:
-  IMG: localhost/odh-operator:e2e
-  IMAGE_BUILDER: podman
-
 jobs:
   get-merge-commit:
     if: contains(github.event.pull_request.labels.*.name, 'run-xks-e2e')
@@ -26,6 +22,8 @@ jobs:
     if: contains(github.event.pull_request.labels.*.name, 'run-xks-e2e')
     runs-on: ubuntu-latest
     env:
+      IMAGE_BUILDER: podman
+      IMG: localhost/odh-operator:e2e
       KIND_CLUSTER_NAME: kind-${{ matrix.provider }}
     strategy:
       fail-fast: false
