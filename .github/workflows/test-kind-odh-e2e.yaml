@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
   inputs:
     test_ref:
-      description: 'temp'
+      description: 'ref'
       default: 'main'
 
 permissions:
@@ -16,13 +16,13 @@ permissions:
 
 jobs:
   get-merge-commit:
-    if: contains(github.event.pull_request.labels.*.name, 'run-xks-e2e')
+    # if: contains(github.event.pull_request.labels.*.name, 'run-xks-e2e')
     name: Get merge commit
     uses: ./.github/workflows/get-merge-commit.yaml
 
   kind-odh-e2e-tests:
     needs: get-merge-commit
-    if: contains(github.event.pull_request.labels.*.name, 'run-xks-e2e')
+    # if: contains(github.event.pull_request.labels.*.name, 'run-xks-e2e')
     runs-on: ubuntu-latest
     permissions:
       contents: read
