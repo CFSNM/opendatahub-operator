@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"slices"
 
 	"github.com/davecgh/go-spew/spew"
@@ -26,6 +27,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	serviceApi "github.com/opendatahub-io/opendatahub-operator/v2/api/services/v1alpha1"
 )
 
 const PlatformFieldOwner = "platform.opendatahub.io"
@@ -103,7 +106,7 @@ func Decode(decoder runtime.Decoder, content []byte) ([]unstructured.Unstructure
 	yd := yaml.NewDecoder(r)
 
 	for {
-		var out map[string]interface{}
+		var out map[string]any
 
 		err := yd.Decode(&out)
 		if err != nil {
@@ -190,9 +193,7 @@ func SetLabels(obj client.Object, values map[string]string) {
 		target = make(map[string]string)
 	}
 
-	for k, v := range values {
-		target[k] = v
-	}
+	maps.Copy(target, values)
 
 	obj.SetLabels(target)
 }
@@ -255,9 +256,7 @@ func SetAnnotations(obj client.Object, values map[string]string) {
 		target = make(map[string]string)
 	}
 
-	for k, v := range values {
-		target[k] = v
-	}
+	maps.Copy(target, values)
 
 	obj.SetAnnotations(target)
 }
@@ -544,7 +543,7 @@ func Apply(ctx context.Context, cli client.Client, in client.Object, opts ...cli
 	unstructured.RemoveNestedField(u.Object, "metadata", "resourceVersion")
 	unstructured.RemoveNestedField(u.Object, "status")
 
-	err = cli.Patch(ctx, u, client.Apply, opts...)
+	err = cli.Patch(ctx, u, client.Apply, opts...) //nolint:staticcheck // TODO: migrate to cli.Apply() with client.ApplyOption once all callers are updated
 	if err != nil {
 		// Include GVK and namespace/name for debugging context without logging sensitive object data
 		objRef := FormatObjectReference(u)
@@ -595,7 +594,7 @@ func ApplyStatus(ctx context.Context, cli client.Client, in client.Object, opts 
 	unstructured.RemoveNestedField(u.Object, "metadata", "managedFields")
 	unstructured.RemoveNestedField(u.Object, "metadata", "resourceVersion")
 
-	err = cli.Status().Patch(ctx, u, client.Apply, opts...)
+	err = cli.Status().Patch(ctx, u, client.Apply, opts...) //nolint:staticcheck // TODO: migrate to cli.Status().Apply() once all callers updated
 	switch {
 	case k8serr.IsNotFound(err): // Cannot be removed like in Apply func because reconciler_finalizer_test.go would then throw an error, needs extensive test rewrite
 		return nil
@@ -737,4 +736,32 @@ func UnsetOwnerReferences(ctx context.Context, cli client.Client, instanceName s
 		}
 	}
 	return nil
+}
+
+// GetGatewayDomain retrieves the gateway domain from GatewayConfig.Status.Domain.
+// This is used by the DSC controller to sync the domain to component specs.
+//
+// Parameters:
+//   - ctx: The context for the operation
+//   - cli: The Kubernetes client
+//
+// Returns:
+//   - string: The gateway domain from GatewayConfig.Status.Domain
+//   - error: An error if the GatewayConfig doesn't exist or domain is empty
+func GetGatewayDomain(ctx context.Context, cli client.Client) (string, error) {
+	gatewayConfig := &serviceApi.GatewayConfig{}
+	gatewayConfig.SetName(serviceApi.GatewayConfigName)
+
+	if err := cli.Get(ctx, client.ObjectKeyFromObject(gatewayConfig), gatewayConfig); err != nil {
+		if k8serr.IsNotFound(err) {
+			return "", errors.New("GatewayConfig not found")
+		}
+		return "", fmt.Errorf("failed to get GatewayConfig: %w", err)
+	}
+
+	if gatewayConfig.Status.Domain == "" {
+		return "", errors.New("GatewayConfig.Status.Domain is empty")
+	}
+
+	return gatewayConfig.Status.Domain, nil
 }

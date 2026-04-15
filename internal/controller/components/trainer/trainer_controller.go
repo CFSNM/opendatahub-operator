@@ -25,16 +25,20 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	componentApi "github.com/opendatahub-io/opendatahub-operator/v2/api/components/v1alpha1"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
+	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/dependency"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/deploy"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/gc"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/render/kustomize"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/status/deployments"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/status/releases"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/handlers"
+	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/predicates"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/predicates/component"
+	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/predicates/dependent"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/predicates/resources"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/reconciler"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/metadata/labels"
@@ -49,7 +53,7 @@ func (s *componentHandler) NewComponentReconciler(ctx context.Context, mgr ctrl.
 		Owns(&rbacv1.ClusterRole{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&corev1.Service{}).
-		Owns(&appsv1.Deployment{}, reconciler.WithPredicates(resources.NewDeploymentPredicate())).
+		Owns(&appsv1.Deployment{}, reconciler.WithPredicates(predicates.DefaultDeploymentPredicate)).
 		OwnsGVK(gvk.ClusterTrainingRuntime, reconciler.Dynamic()).
 		Watches(
 			&extv1.CustomResourceDefinition{},
@@ -58,8 +62,25 @@ func (s *componentHandler) NewComponentReconciler(ctx context.Context, mgr ctrl.
 			reconciler.WithPredicates(
 				component.ForLabel(labels.ODH.Component(ComponentName), labels.True)),
 		).
+		WatchesGVK(gvk.JobSetOperatorV1,
+			reconciler.WithEventHandler(
+				handlers.ToNamed(componentApi.TrainerInstanceName),
+			),
+			reconciler.WithPredicates(
+				predicate.Or(
+					dependent.New(dependent.WithWatchStatus(true)),
+					resources.CreatedOrUpdatedOrDeletedNamed("cluster"),
+				),
+			),
+			reconciler.Dynamic(reconciler.CrdExists(gvk.JobSetOperatorV1))).
 		WithAction(checkPreConditions).
 		WithAction(initialize).
+		WithAction(dependency.NewAction(
+			dependency.MonitorOperator(dependency.OperatorConfig{
+				OperatorGVK: gvk.JobSetOperatorV1,
+				Filter:      jobSetConditionFilter,
+			}),
+		)).
 		WithAction(releases.NewAction()).
 		WithAction(kustomize.NewAction()).
 		WithAction(deploy.NewAction(

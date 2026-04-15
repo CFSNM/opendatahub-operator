@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
-	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -14,7 +13,6 @@ import (
 	componentApi "github.com/opendatahub-io/opendatahub-operator/v2/api/components/v1alpha1"
 	dscv2 "github.com/opendatahub-io/opendatahub-operator/v2/api/datasciencecluster/v2"
 	dsciv2 "github.com/opendatahub-io/opendatahub-operator/v2/api/dscinitialization/v2"
-	infrav1 "github.com/opendatahub-io/opendatahub-operator/v2/api/infrastructure/v1"
 	serviceApi "github.com/opendatahub-io/opendatahub-operator/v2/api/services/v1alpha1"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster"
 )
@@ -49,7 +47,7 @@ func CreateDefaultDSC(ctx context.Context, cli client.Client) error {
 					ManagementSpec: common.ManagementSpec{ManagementState: operatorv1.Managed},
 				},
 				Kueue: componentApi.DSCKueue{
-					KueueManagementSpec: componentApi.KueueManagementSpec{ManagementState: operatorv1.Managed},
+					KueueManagementSpec: componentApi.KueueManagementSpec{ManagementState: operatorv1.Removed},
 				},
 				TrustyAI: componentApi.DSCTrustyAI{
 					ManagementSpec: common.ManagementSpec{ManagementState: operatorv1.Managed},
@@ -58,12 +56,21 @@ func CreateDefaultDSC(ctx context.Context, cli client.Client) error {
 					ManagementSpec: common.ManagementSpec{ManagementState: operatorv1.Managed},
 				},
 				TrainingOperator: componentApi.DSCTrainingOperator{
-					ManagementSpec: common.ManagementSpec{ManagementState: operatorv1.Managed},
-				},
-				FeastOperator: componentApi.DSCFeastOperator{
 					ManagementSpec: common.ManagementSpec{ManagementState: operatorv1.Removed},
 				},
+				FeastOperator: componentApi.DSCFeastOperator{
+					ManagementSpec: common.ManagementSpec{ManagementState: operatorv1.Managed},
+				},
 				LlamaStackOperator: componentApi.DSCLlamaStackOperator{
+					ManagementSpec: common.ManagementSpec{ManagementState: operatorv1.Removed},
+				},
+				MLflowOperator: componentApi.DSCMLflowOperator{
+					ManagementSpec: common.ManagementSpec{ManagementState: operatorv1.Removed},
+				},
+				Trainer: componentApi.DSCTrainer{
+					ManagementSpec: common.ManagementSpec{ManagementState: operatorv1.Managed},
+				},
+				SparkOperator: componentApi.DSCSparkOperator{
 					ManagementSpec: common.ManagementSpec{ManagementState: operatorv1.Removed},
 				},
 			},
@@ -125,40 +132,5 @@ func CreateDefaultDSCI(ctx context.Context, cli client.Client, _ common.Platform
 			return err
 		}
 	}
-	return nil
-}
-
-// CreateDefaultGateway creates a default instance of GatewayConfig.
-// If a GatewayConfig already exists, it will not be recreated.
-func CreateDefaultGateway(ctx context.Context, cli client.Client) error {
-	log := logf.FromContext(ctx)
-
-	defaultGateway := &serviceApi.GatewayConfig{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: serviceApi.GatewayConfigName,
-		},
-		Spec: serviceApi.GatewayConfigSpec{
-			Certificate: &infrav1.CertificateSpec{
-				Type:       infrav1.OpenshiftDefaultIngress,
-				SecretName: "default-gateway-tls",
-			},
-		},
-	}
-
-	existingGateway := &serviceApi.GatewayConfig{}
-	err := cli.Get(ctx, client.ObjectKey{Name: serviceApi.GatewayConfigName}, existingGateway)
-	if err != nil {
-		if k8serr.IsNotFound(err) {
-			if createErr := cli.Create(ctx, defaultGateway); createErr != nil {
-				return fmt.Errorf("unable to create default Gateway CR: %w", createErr)
-			}
-			log.Info("Created default Gateway CR", "name", serviceApi.GatewayConfigName)
-		} else {
-			return fmt.Errorf("error checking for existing Gateway CR: %w", err)
-		}
-	} else {
-		log.Info("Default Gateway CR already exists", "name", serviceApi.GatewayConfigName)
-	}
-
 	return nil
 }

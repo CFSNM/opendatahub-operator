@@ -1,20 +1,28 @@
 # Build the manager binary
-ARG GOLANG_VERSION=1.24
+ARG GOLANG_VERSION=1.25
 
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
+ARG BUILD_TYPE
 
 ################################################################################
 FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/toolbox as manifests
 ARG USE_LOCAL=false
+ARG BUILD_TYPE=RELEASE
+#Possible values of BUILD_TYPE: LOCAL - for playpen builds, RELEASE - for ODH release builds, CI - for ODH CI/Nightlies
 ARG OVERWRITE_MANIFESTS=""
 USER root
 WORKDIR /
 COPY opt/manifests/ /opt/manifests/
+COPY opt/charts/ /opt/charts/
 COPY get_all_manifests.sh get_all_manifests.sh
-RUN if [ "${USE_LOCAL}" != "true" ]; then \
+RUN if [[ "${BUILD_TYPE}" == "RELEASE" && "${USE_LOCAL}" != "true" ]]; then \
         rm -rf /opt/manifests/*; \
         ODH_PLATFORM_TYPE=rhoai ./get_all_manifests.sh ${OVERWRITE_MANIFESTS}; \
+    elif [ "${BUILD_TYPE}" == "CI" ]; then \
+        rm -rf /opt/manifests/*; \
+        ls -la /cachi2/prefetched-manifests; \
+        cp -r /cachi2/prefetched-manifests/* /opt/manifests/; \
     fi
 
 # Clean up unwanted directories and files from manifests
@@ -43,6 +51,10 @@ WORKDIR /workspace
 # Copy the Go Modules manifests
 COPY go.mod go.mod
 COPY go.sum go.sum
+COPY pkg/clusterhealth/go.mod pkg/clusterhealth/go.mod
+COPY pkg/clusterhealth/go.sum pkg/clusterhealth/go.sum
+COPY pkg/failureclassifier/go.mod pkg/failureclassifier/go.mod
+COPY pkg/failureclassifier/go.sum pkg/failureclassifier/go.sum
 # cache deps before building and copying source so that we don't need to re-download as much
 # and so that source changes don't invalidate our downloaded layer
 RUN go mod download
@@ -51,23 +63,29 @@ RUN go mod download
 COPY api/ api/
 COPY internal/ internal/
 COPY cmd/main.go cmd/main.go
+COPY cmd/cloudmanager/ cmd/cloudmanager/
 COPY pkg/ pkg/
 
 # Build stripe out debug info to minimize binary size
 RUN CGO_ENABLED=${CGO_ENABLED} GOOS=linux GOARCH=${TARGETARCH} go build -a -ldflags="-s -w" -tags strictfipsruntime,rhoai -o manager cmd/main.go
 
+# Build cloudmanager binary
+RUN CGO_ENABLED=${CGO_ENABLED} GOOS=linux GOARCH=${TARGETARCH} go build -a -ldflags="-s -w" -tags strictfipsruntime -o cloudmanager ./cmd/cloudmanager/
+
 ################################################################################
 FROM --platform=$TARGETPLATFORM registry.access.redhat.com/ubi9/ubi-minimal:latest
 WORKDIR /
 COPY --from=builder /workspace/manager .
+COPY --from=builder /workspace/cloudmanager .
 COPY --chown=1001:0 --from=manifests /opt/manifests /opt/manifests
+COPY --chown=1001:0 --from=manifests /opt/charts /opt/charts
 
 # tar installed to allow easy use of "oc cp" for component dev use cases.
 # See hack/component-dev/README.md in the source repo for more info.
 RUN microdnf install -y tar && microdnf clean all
 
 # Recursive change all files
-RUN chmod -R g=u /opt/manifests
+RUN chmod -R g=u /opt/manifests /opt/charts
 USER 1001
 
 ENTRYPOINT ["/manager"]

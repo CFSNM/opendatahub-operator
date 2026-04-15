@@ -3,9 +3,9 @@ kind: HTTPRoute
 metadata:
   name: {{.OAuthCallbackRouteName}}
   namespace: {{.GatewayNamespace}}
+  labels:
+    {{.ComponentLabelKey}}: {{.ComponentLabelValue}}
 spec:
-  hostnames:
-    - {{.GatewayHostname}}
   parentRefs:
     - name: {{.GatewayName}}
       namespace: {{.GatewayNamespace}}

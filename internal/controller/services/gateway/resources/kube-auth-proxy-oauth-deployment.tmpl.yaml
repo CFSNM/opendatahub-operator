@@ -5,6 +5,7 @@ metadata:
   namespace: {{.GatewayNamespace}}
   labels:
     app: {{.KubeAuthProxyServiceName}}
+    {{.ComponentLabelKey}}: {{.ComponentLabelValue}}
 spec:
   replicas: 2
   selector:
@@ -14,9 +15,11 @@ spec:
     metadata:
       labels:
         app: {{.KubeAuthProxyServiceName}}
+        {{.ComponentLabelKey}}: {{.ComponentLabelValue}}
       annotations:
         opendatahub.io/secret-hash: "{{.AuthConfigHash}}"
     spec:
+      serviceAccountName: {{.KubeAuthProxyServiceName}}
       securityContext:
         runAsNonRoot: true
         seccompProfile:
@@ -29,6 +32,11 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 10Mi
+        {{- if .ProviderCASecret }}
+        - name: provider-ca-cert
+          secret:
+            secretName: {{.ProviderCASecretName}}
+        {{- end }}
       containers:
         - name: {{.KubeAuthProxyServiceName}}
           image: {{.KubeAuthProxyImage}}
@@ -63,13 +71,17 @@ spec:
               mountPath: {{.TLSCertsMountPath}}
             - name: tmp
               mountPath: /tmp
+            {{- if .ProviderCASecret }}
+            - name: provider-ca-cert
+              readOnly: true
+              mountPath: /etc/provider-ca
+            {{- end }}
           resources:
             requests:
-              cpu: "10m"
-              memory: "32Mi"
+              cpu: "500m"
+              memory: "128Mi"
             limits:
-              cpu: "50m"
-              memory: "64Mi"
+              memory: "128Mi"
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -86,10 +98,14 @@ spec:
             - "--skip-jwt-bearer-tokens=true"
             - "--pass-access-token=true"
             - "--set-xauthrequest=true"
+            - "--enable-k8s-token-validation={{.EnableK8sTokenValidation}}"
             - "--redirect-url={{.RedirectURL}}"
             - "--tls-cert-file={{.TLSCertsMountPath}}/tls.crt"
             - "--tls-key-file={{.TLSCertsMountPath}}/tls.key"
             - "--use-system-trust-store=true"
+            {{- if .ProviderCASecret }}
+            - "--provider-ca-file=/etc/provider-ca/ca.crt"
+            {{- end }}
             - "--cookie-expire={{.CookieExpire}}"
             - "--cookie-refresh={{.CookieRefresh}}"
             - "--cookie-secure=true"
@@ -98,4 +114,5 @@ spec:
             - "--cookie-name={{.AuthProxyCookieName}}"
             - "--cookie-domain={{.GatewayHostname}}"
             - "--provider=openshift"
+            - "--ssl-insecure-skip-verify={{.InsecureSkipVerify}}"
             - "--scope=user:full"

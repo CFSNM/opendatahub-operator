@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
+	operatorv1 "github.com/openshift/api/operator/v1"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -30,6 +32,7 @@ import (
 	serviceApi "github.com/opendatahub-io/opendatahub-operator/v2/api/services/v1alpha1"
 	"github.com/opendatahub-io/opendatahub-operator/v2/internal/webhook/hardwareprofile"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
+	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/dsc/compare"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/resources"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/envt"
 )
@@ -40,8 +43,8 @@ const DefaultWebhookTimeout = 30 * time.Second
 
 // defaultCRDInstallOptions provides consistent configuration for waiting on CRD establishment.
 var defaultCRDInstallOptions = envtest.CRDInstallOptions{
-	PollInterval: 100 * time.Millisecond,
-	MaxTime:      30 * time.Second,
+	PollInterval: envt.DefaultPollInterval,
+	MaxTime:      envt.DefaultMaxWait,
 }
 
 // =============================================================================
@@ -248,7 +251,9 @@ func WithLlmInferenceService() CRDSetupOption {
 
 		// Register LlmInferenceService types
 		env.Scheme().AddKnownTypeWithName(gvk.LLMInferenceServiceV1Alpha1, &unstructured.Unstructured{})
-		env.Scheme().AddKnownTypeWithName(gvk.LLMInferenceServiceV1Alpha1.GroupVersion().WithKind("LlmInferenceServiceList"), &unstructured.UnstructuredList{})
+		env.Scheme().AddKnownTypeWithName(gvk.LLMInferenceServiceV1Alpha1.GroupVersion().WithKind("LLMInferenceServiceList"), &unstructured.UnstructuredList{})
+		env.Scheme().AddKnownTypeWithName(gvk.LLMInferenceServiceV1Alpha2, &unstructured.Unstructured{})
+		env.Scheme().AddKnownTypeWithName(gvk.LLMInferenceServiceV1Alpha2.GroupVersion().WithKind("LLMInferenceServiceList"), &unstructured.UnstructuredList{})
 
 		// Create LlmInferenceService CRD
 		crd := MockLlmInferenceServiceCRD()
@@ -292,6 +297,40 @@ func WithDashboardHardwareProfile() CRDSetupOption {
 		crd := MockDashboardHardwareProfileCRD()
 		if err := createAndWaitForCRD(ctx, env, crd); err != nil {
 			return fmt.Errorf("failed to create and wait for Dashboard HardwareProfile CRD: %w", err)
+		}
+
+		return nil
+	}
+}
+
+// WithPodMonitor enables PodMonitor CRD registration in the test environment.
+// Note: PodMonitor types are already registered in the default scheme via monitoringv1.AddToScheme.
+func WithPodMonitor() CRDSetupOption {
+	return func(ctx context.Context, t *testing.T, env *envt.EnvT) error {
+		t.Helper()
+
+		// Create PodMonitor CRD
+		// (types are already registered in scheme via pkg/utils/test/scheme)
+		crd := MockPodMonitorCRD()
+		if err := createAndWaitForCRD(ctx, env, crd); err != nil {
+			return fmt.Errorf("failed to create and wait for PodMonitor CRD: %w", err)
+		}
+
+		return nil
+	}
+}
+
+// WithServiceMonitor enables ServiceMonitor CRD registration in the test environment.
+// Note: ServiceMonitor types are already registered in the default scheme via monitoringv1.AddToScheme.
+func WithServiceMonitor() CRDSetupOption {
+	return func(ctx context.Context, t *testing.T, env *envt.EnvT) error {
+		t.Helper()
+
+		// Create ServiceMonitor CRD
+		// (types are already registered in scheme via pkg/utils/test/scheme)
+		crd := MockServiceMonitorCRD()
+		if err := createAndWaitForCRD(ctx, env, crd); err != nil {
+			return fmt.Errorf("failed to create and wait for ServiceMonitor CRD: %w", err)
 		}
 
 		return nil
@@ -402,6 +441,57 @@ func NewDSCV1(name string, opts ...func(*dscv1.DataScienceCluster)) *dscv1.DataS
 	return dsc
 }
 
+// =============================================================================
+// DSC Component Configuration Helpers
+// =============================================================================
+
+// WithAllV2OnlyComponentsRemoved returns an option function that sets all v2-only components to Removed.
+// This is useful for tests that need all v2-only components in Removed state.
+// Uses reflection to dynamically detect v2-only components, so it automatically handles new v2-only components.
+func WithAllV2OnlyComponentsRemoved() func(*dscv2.DataScienceCluster) {
+	return func(dsc *dscv2.DataScienceCluster) {
+		// Get v2-only component field names from shared utility
+		v2OnlyFieldNames := compare.GetV2OnlyComponentFieldNames()
+
+		// Use reflection to set each v2-only component to Removed
+		componentsValue := reflect.ValueOf(&dsc.Spec.Components).Elem()
+
+		for _, fieldName := range v2OnlyFieldNames {
+			field := componentsValue.FieldByName(fieldName)
+			if !field.IsValid() {
+				continue // Skip if field doesn't exist (shouldn't happen)
+			}
+
+			// Get the ManagementState field of this component
+			managementStateField := field.FieldByName("ManagementState")
+			if managementStateField.IsValid() && managementStateField.CanSet() {
+				managementStateField.Set(reflect.ValueOf(operatorv1.Removed))
+			}
+		}
+	}
+}
+
+// WithTrainerManaged returns an option function that sets Trainer to Managed.
+func WithTrainerManaged() func(*dscv2.DataScienceCluster) {
+	return func(dsc *dscv2.DataScienceCluster) {
+		dsc.Spec.Components.Trainer.ManagementState = operatorv1.Managed
+	}
+}
+
+// WithMLflowOperatorManaged returns an option function that sets MLflowOperator to Managed.
+func WithMLflowOperatorManaged() func(*dscv2.DataScienceCluster) {
+	return func(dsc *dscv2.DataScienceCluster) {
+		dsc.Spec.Components.MLflowOperator.ManagementState = operatorv1.Managed
+	}
+}
+
+// WithSparkOperatorManaged returns an option function that sets SparkOperator to Managed.
+func WithSparkOperatorManaged() func(*dscv2.DataScienceCluster) {
+	return func(dsc *dscv2.DataScienceCluster) {
+		dsc.Spec.Components.SparkOperator.ManagementState = operatorv1.Managed
+	}
+}
+
 // NewAuth creates an Auth object with the given name, namespace, and groups for use in tests.
 //
 // Parameters:
@@ -500,8 +590,8 @@ func NewNotebook(name, namespace string, opts ...ObjectOption) client.Object {
 	notebook.SetNamespace(namespace)
 
 	// Set basic spec structure needed for webhook testing
-	containers := []interface{}{
-		map[string]interface{}{
+	containers := []any{
+		map[string]any{
 			"name":  "notebook",
 			"image": "jupyter/base-notebook:latest",
 		},
@@ -514,6 +604,30 @@ func NewNotebook(name, namespace string, opts ...ObjectOption) client.Object {
 		opt(notebook)
 	}
 	return notebook
+}
+
+// NewTrainJob creates a TrainJob object with the given name and namespace for use in tests.
+//
+// Parameters:
+//   - name: The name of the TrainJob object.
+//   - namespace: The namespace for the object.
+//
+// Returns:
+//   - client.Object: The constructed TrainJob object as an unstructured object.
+func NewTrainJob(name, namespace string, opts ...ObjectOption) client.Object {
+	trainJob := resources.GvkToUnstructured(gvk.TrainJob)
+	trainJob.SetName(name)
+	trainJob.SetNamespace(namespace)
+
+	// Set basic spec structure needed for webhook testing
+	if err := unstructured.SetNestedField(trainJob.Object, "torch-distributed", "spec", "runtimeRef", "name"); err != nil {
+		panic(fmt.Sprintf("failed to set trainjob runtimeRef: %v", err))
+	}
+
+	for _, opt := range opts {
+		opt(trainJob)
+	}
+	return trainJob
 }
 
 // NewInferenceService creates an InferenceService object with the given name and namespace for use in tests.
@@ -531,7 +645,7 @@ func NewInferenceService(name, namespace string, opts ...ObjectOption) client.Ob
 
 	// Set basic spec structure needed for webhook testing
 	// Create a model object instead of containers for isvc
-	model := map[string]interface{}{
+	model := map[string]any{
 		"name":  "isvc-model",
 		"image": "kserve/model-server:latest",
 	}
@@ -559,9 +673,9 @@ func NewLLMInferenceService(name, namespace string, opts ...ObjectOption) client
 	llmInferenceService.SetNamespace(namespace)
 
 	// this is set in case HWprofile require resource changes, it is not necessary for Connection API
-	containers := []interface{}{
-		map[string]interface{}{
-			"name":  "llm-container",
+	containers := []any{
+		map[string]any{
+			"name":  "main",
 			"image": "kserve/llm-container:latest",
 		},
 	}
@@ -881,6 +995,7 @@ func NewAdmissionRequest(
 			UID:       "test-uid",
 			Kind:      metav1.GroupVersionKind{Group: kind.Group, Version: kind.Version, Kind: kind.Kind},
 			Resource:  resource,
+			Name:      obj.GetName(),
 			Namespace: obj.GetNamespace(),
 			Operation: op,
 			Object:    runtime.RawExtension{Raw: objBytes},
@@ -971,18 +1086,30 @@ func MockLlmInferenceServiceCRD() *apiextensionsv1.CustomResourceDefinition {
 				Kind:     "LLMInferenceService",
 			},
 			Scope: "Namespaced",
-			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{{
-				Name:    "v1alpha1",
-				Served:  true,
-				Storage: true,
-				Schema: &apiextensionsv1.CustomResourceValidation{
-					OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
-						Type: "object",
-						// This allows any structure
-						XPreserveUnknownFields: &preserveUnknownFields,
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+				{
+					Name:    "v1alpha1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensionsv1.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+							Type:                   "object",
+							XPreserveUnknownFields: &preserveUnknownFields,
+						},
 					},
 				},
-			}},
+				{
+					Name:    "v1alpha2",
+					Served:  true,
+					Storage: false,
+					Schema: &apiextensionsv1.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+							Type:                   "object",
+							XPreserveUnknownFields: &preserveUnknownFields,
+						},
+					},
+				},
+			},
 		},
 	}
 }
@@ -1036,6 +1163,68 @@ func MockDashboardHardwareProfileCRD() *apiextensionsv1.CustomResourceDefinition
 			Scope: "Namespaced",
 			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{{
 				Name:    "v1alpha1",
+				Served:  true,
+				Storage: true,
+				Schema: &apiextensionsv1.CustomResourceValidation{
+					OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+						Type:                   "object",
+						XPreserveUnknownFields: &preserveUnknownFields,
+					},
+				},
+			}},
+		},
+	}
+}
+
+// MockPodMonitorCRD creates a mock PodMonitor CRD for testing.
+func MockPodMonitorCRD() *apiextensionsv1.CustomResourceDefinition {
+	preserveUnknownFields := true
+
+	return &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "podmonitors.monitoring.coreos.com",
+		},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: gvk.CoreosPodMonitor.Group,
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Plural:   "podmonitors",
+				Singular: "podmonitor",
+				Kind:     gvk.CoreosPodMonitor.Kind,
+			},
+			Scope: "Namespaced",
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{{
+				Name:    "v1",
+				Served:  true,
+				Storage: true,
+				Schema: &apiextensionsv1.CustomResourceValidation{
+					OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+						Type:                   "object",
+						XPreserveUnknownFields: &preserveUnknownFields,
+					},
+				},
+			}},
+		},
+	}
+}
+
+// MockServiceMonitorCRD creates a mock ServiceMonitor CRD for testing.
+func MockServiceMonitorCRD() *apiextensionsv1.CustomResourceDefinition {
+	preserveUnknownFields := true
+
+	return &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "servicemonitors.monitoring.coreos.com",
+		},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: gvk.CoreosServiceMonitor.Group,
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Plural:   "servicemonitors",
+				Singular: "servicemonitor",
+				Kind:     gvk.CoreosServiceMonitor.Kind,
+			},
+			Scope: "Namespaced",
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{{
+				Name:    "v1",
 				Served:  true,
 				Storage: true,
 				Schema: &apiextensionsv1.CustomResourceValidation{

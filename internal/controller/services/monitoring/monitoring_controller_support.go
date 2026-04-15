@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	controllerutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -66,13 +68,13 @@ var componentIDRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(?:/[A-Za-z0-9][A-
 //
 // Note: This image version must stay compatible with the Cluster Observability Operator (COO) version
 // that we depend on. When upgrading COO, verify Perses image compatibility and update accordingly.
-// The current image is compatible with COO 1.2.2.
+// The current image is compatible with COO 1.3.1.
 func getPersesImage() string {
-	if image := os.Getenv("RELATED_IMAGE_PERSES"); image != "" {
+	if image := os.Getenv("RELATED_IMAGE_PERSES_IMAGE"); image != "" {
 		return image
 	}
 
-	return "registry.redhat.io/cluster-observability-operator/perses-0-50-rhel9:1.2.2-1752686994"
+	return "registry.redhat.io/cluster-observability-operator/perses-rhel9:1.3.1-1765876130"
 }
 
 // isLocalServiceEndpoint checks if an endpoint URL is for a local/in-cluster service.
@@ -176,13 +178,13 @@ func validateExporters(exporters map[string]runtime.RawExtension) (map[string]st
 		}
 
 		// Convert RawExtension to a map for validation and YAML conversion
-		var config map[string]interface{}
+		var config map[string]any
 		if err := yaml.Unmarshal(raw, &config); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal exporter config for '%s': %w", name, err)
 		}
 		// Treat empty/whitespace and YAML null as empty object for consistent rendering.
 		if config == nil {
-			config = map[string]interface{}{}
+			config = map[string]any{}
 		}
 
 		// Enhanced security validations
@@ -215,17 +217,39 @@ func addTracesTemplateData(templateData map[string]any, traces *serviceApi.Trace
 	// Add retention for all backends (both TempoMonolithic and TempoStack)
 	templateData["TracesRetention"] = traces.Storage.Retention.Duration.String()
 
+	// Determine TLS enabled state for query endpoints (reuses existing TLS configuration)
+	tlsEnabled := determineTLSEnabled(traces)
+	templateData["TempoTLSEnabled"] = tlsEnabled
+
+	// Set TLS certificate configuration
+	if tlsEnabled {
+		// traces.TLS is guaranteed non-nil here since determineTLSEnabled returns false when TLS is nil
+		templateData["TempoCertificateSecret"] = traces.TLS.CertificateSecret
+		templateData["TempoCAConfigMap"] = traces.TLS.CAConfigMap
+	} else {
+		// Set empty values to avoid template missing key errors
+		templateData["TempoCertificateSecret"] = ""
+		templateData["TempoCAConfigMap"] = ""
+	}
+
 	// Add tempo-related data from traces.Storage fields (Storage is a struct, not a pointer)
+	// Note: Gateway endpoints always use HTTPS (service-ca auto-provisions TLS)
+	// In multitenancy/openshift mode, Tempo receivers listen on localhost only, so all
+	// external traffic (including OTel collector ingestion) must go through the gateway.
 	switch traces.Storage.Backend {
-	case "pv":
-		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempomonolithic.%s.svc.cluster.local:4317", namespace)
-		// Perses datasource needs HTTP query endpoint (port 3200)
-		templateData["TempoQueryEndpoint"] = fmt.Sprintf("http://tempo-data-science-tempomonolithic.%s.svc.cluster.local:3200", namespace)
+	case serviceApi.StorageBackendPV:
+		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:4317", namespace)
+		// Perses datasource query endpoint via gateway (port 8080) - always uses HTTPS (gateway is HTTPS-only).
+		// The gateway path prefix includes the tenant name and "tempo" path segment:
+		//   /api/traces/v1/{tenant}/tempo  ->  Perses appends /api/search etc.
+		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
 		templateData["Size"] = traces.Storage.Size
-	case "s3", "gcs":
+	case serviceApi.StorageBackendS3, serviceApi.StorageBackendGCS:
 		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempostack-gateway.%s.svc.cluster.local:4317", namespace)
-		// Perses datasource needs HTTP query endpoint via gateway (port 8080)
-		templateData["TempoQueryEndpoint"] = fmt.Sprintf("http://tempo-data-science-tempostack-gateway.%s.svc.cluster.local:8080", namespace)
+		// Perses datasource query endpoint via gateway (port 8080) - always uses HTTPS (gateway is HTTPS-only).
+		// The gateway path prefix includes the tenant name and "tempo" path segment:
+		//   /api/traces/v1/{tenant}/tempo  ->  Perses appends /api/search etc.
+		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempostack-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
 		templateData["Secret"] = traces.Storage.Secret
 	}
 
@@ -285,6 +309,39 @@ func getImageURL(envVar, upstreamDefault, rhoaiDefault string, platform apicommo
 	return upstreamDefault
 }
 
+// resolvePersesAPIVersion probes the cluster to determine which Perses CRD API
+// version is available, preferring v1alpha2 over v1alpha1.
+func resolvePersesAPIVersion(ctx context.Context, cli client.Client) (string, bool, error) {
+	gk := schema.GroupKind{Group: "perses.dev", Kind: "Perses"}
+
+	found, err := cluster.HasCRDWithVersion(ctx, cli, gk, persesV1Alpha2)
+	if err != nil {
+		return "", false, err
+	}
+	if found {
+		return persesV1Alpha2, true, nil
+	}
+
+	found, err = cluster.HasCRDWithVersion(ctx, cli, gk, "v1alpha1")
+	if err != nil {
+		return "", false, err
+	}
+	if found {
+		return "v1alpha1", true, nil
+	}
+
+	return "", false, nil
+}
+
+// persesGVKs returns the Perses, PersesDatasource, and PersesDashboard GVKs
+// for the given API version string.
+func persesGVKs(version string) (schema.GroupVersionKind, schema.GroupVersionKind, schema.GroupVersionKind) {
+	if version == persesV1Alpha2 {
+		return gvk.PersesV1Alpha2, gvk.PersesDatasourceV1Alpha2, gvk.PersesDashboardV1Alpha2
+	}
+	return gvk.PersesV1Alpha1, gvk.PersesDatasourceV1Alpha1, gvk.PersesDashboardV1Alpha1
+}
+
 func getTemplateData(ctx context.Context, rr *odhtypes.ReconciliationRequest) (map[string]any, error) {
 	monitoring, ok := rr.Instance.(*serviceApi.Monitoring)
 	if !ok {
@@ -303,6 +360,14 @@ func getTemplateData(ctx context.Context, rr *odhtypes.ReconciliationRequest) (m
 		return nil, err
 	}
 
+	persesAPIVersion, _, err := resolvePersesAPIVersion(ctx, rr.Client)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve Perses API version: %w", err)
+	}
+	if persesAPIVersion == "" {
+		persesAPIVersion = persesV1Alpha2
+	}
+
 	templateData := map[string]any{
 		"Namespace":            monitoring.Spec.Namespace,
 		"Traces":               monitoring.Spec.Traces != nil,
@@ -313,6 +378,7 @@ func getTemplateData(ctx context.Context, rr *odhtypes.ReconciliationRequest) (m
 		"MetricsExporters":     make(map[string]string),
 		"MetricsExporterNames": []string{},
 		"PersesImage":          getPersesImage(),
+		"PersesAPIVersion":     persesAPIVersion,
 	}
 
 	// always add resource defaults
@@ -328,7 +394,6 @@ func getTemplateData(ctx context.Context, rr *odhtypes.ReconciliationRequest) (m
 
 	// Add traces-related data if traces are configured
 	if traces := monitoring.Spec.Traces; traces != nil {
-		addTracesData(traces, monitoring.Spec.Namespace, templateData)
 		if err := addTracesTemplateData(templateData, traces, monitoring.Spec.Namespace); err != nil {
 			return nil, err
 		}
@@ -371,7 +436,7 @@ func checkMonitoringPreconditions(ctx context.Context, rr *odhtypes.Reconciliati
 
 	// Check for opentelemetry-product operator if either metrics or traces are enabled
 	if monitoring.Spec.Metrics != nil || monitoring.Spec.Traces != nil {
-		if found, err := cluster.OperatorExists(ctx, rr.Client, opentelemetryOperator); err != nil || !found {
+		if openTelemetryInfo, err := cluster.OperatorExists(ctx, rr.Client, opentelemetryOperator); err != nil || openTelemetryInfo == nil {
 			if err != nil {
 				return odherrors.NewStopErrorW(err)
 			}
@@ -381,7 +446,7 @@ func checkMonitoringPreconditions(ctx context.Context, rr *odhtypes.Reconciliati
 
 	// Check for cluster-observability-operator if metrics are enabled
 	if monitoring.Spec.Metrics != nil {
-		if found, err := cluster.OperatorExists(ctx, rr.Client, clusterObservabilityOperator); err != nil || !found {
+		if clusterObservabilityOperatorInfo, err := cluster.OperatorExists(ctx, rr.Client, clusterObservabilityOperator); err != nil || clusterObservabilityOperatorInfo == nil {
 			if err != nil {
 				return odherrors.NewStopErrorW(err)
 			}
@@ -391,7 +456,7 @@ func checkMonitoringPreconditions(ctx context.Context, rr *odhtypes.Reconciliati
 
 	// Check for tempo-product operator if traces are enabled
 	if monitoring.Spec.Traces != nil {
-		if found, err := cluster.OperatorExists(ctx, rr.Client, tempoOperator); err != nil || !found {
+		if tempoOperatorInfo, err := cluster.OperatorExists(ctx, rr.Client, tempoOperator); err != nil || tempoOperatorInfo == nil {
 			if err != nil {
 				return odherrors.NewStopErrorW(err)
 			}
@@ -538,48 +603,15 @@ func addExportersData(metrics *serviceApi.Metrics, templateData map[string]any) 
 	return nil
 }
 
-// addTracesData adds traces configuration data to the template data map.
-func addTracesData(traces *serviceApi.Traces, namespace string, templateData map[string]any) {
-	templateData["OtlpEndpoint"] = fmt.Sprintf("http://data-science-collector.%s.svc.cluster.local:4317", namespace)
-	templateData["SampleRatio"] = traces.SampleRatio
-	templateData["Backend"] = traces.Storage.Backend // backend has default "pv" set in API
-
-	tlsEnabled := determineTLSEnabled(traces)
-	templateData["TempoTLSEnabled"] = tlsEnabled
-
-	if tlsEnabled && traces.TLS != nil {
-		templateData["TempoCertificateSecret"] = traces.TLS.CertificateSecret
-		templateData["TempoCAConfigMap"] = traces.TLS.CAConfigMap
-	} else {
-		// Set empty values to avoid template missing key errors
-		templateData["TempoCertificateSecret"] = ""
-		templateData["TempoCAConfigMap"] = ""
-	}
-
-	templateData["TracesRetention"] = traces.Storage.Retention.Duration.String()
-
-	setTempoEndpointAndStorageData(traces, namespace, templateData)
-}
-
 // determineTLSEnabled determines if TLS should be enabled for traces.
+// TLS must be explicitly enabled via traces.TLS.Enabled field.
+// Default is false to avoid Tempo operator certificate provisioning issues.
 func determineTLSEnabled(traces *serviceApi.Traces) bool {
 	if traces.TLS != nil {
 		return traces.TLS.Enabled
 	}
-	return traces.Storage.Backend == "pv"
-}
-
-// setTempoEndpointAndStorageData sets the tempo endpoint and storage-specific data.
-func setTempoEndpointAndStorageData(traces *serviceApi.Traces, namespace string, templateData map[string]any) {
-	switch traces.Storage.Backend {
-	case "pv":
-		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempomonolithic.%s.svc.cluster.local:4317", namespace)
-		templateData["Size"] = traces.Storage.Size
-	case "s3", "gcs":
-		// Always use gateway endpoint for S3/GCS backends (required for OpenShift mode)
-		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempostack-gateway.%s.svc.cluster.local:4317", namespace)
-		templateData["Secret"] = traces.Storage.Secret
-	}
+	// Default to false - user must explicitly enable TLS
+	return false
 }
 
 // getResourceValueOrDefault returns the resource value or a default if empty or zero.
@@ -628,7 +660,7 @@ type FieldType struct {
 // ValidationRule defines custom validation logic.
 type ValidationRule struct {
 	Name     string
-	Validate func(field string, value interface{}) error
+	Validate func(field string, value any) error
 }
 
 // Schema definitions for metrics exporters.
@@ -666,7 +698,7 @@ var metricsExporterSchemas = map[string]ExporterSchema{
 			"endpoint": {
 				{
 					Name: "secure_endpoint_check",
-					Validate: func(field string, value interface{}) error {
+					Validate: func(field string, value any) error {
 						if str, ok := value.(string); ok {
 							if strings.HasPrefix(str, "http://") && !isLocalServiceEndpoint(str) {
 								return errors.New("insecure HTTP endpoints not allowed for external services")
@@ -708,7 +740,7 @@ var metricsExporterSchemas = map[string]ExporterSchema{
 			"endpoint": {
 				{
 					Name: "secure_endpoint_check",
-					Validate: func(field string, value interface{}) error {
+					Validate: func(field string, value any) error {
 						if str, ok := value.(string); ok {
 							if strings.HasPrefix(str, "http://") && !isLocalServiceEndpoint(str) {
 								return errors.New("insecure HTTP endpoints not allowed for external services")
@@ -764,7 +796,7 @@ var metricsExporterSchemas = map[string]ExporterSchema{
 			"endpoint": {
 				{
 					Name: "secure_endpoint_check",
-					Validate: func(field string, value interface{}) error {
+					Validate: func(field string, value any) error {
 						if str, ok := value.(string); ok {
 							if strings.HasPrefix(str, "http://") && !isLocalServiceEndpoint(str) {
 								return errors.New("insecure HTTP endpoints not allowed for external services")
@@ -779,7 +811,7 @@ var metricsExporterSchemas = map[string]ExporterSchema{
 }
 
 // validateExporterConfigSecurity performs additional security validations on exporter configurations.
-func validateExporterConfigSecurity(name string, config map[string]interface{}) error {
+func validateExporterConfigSecurity(name string, config map[string]any) error {
 	// Check maximum number of fields
 	if len(config) > maxConfigFields {
 		return fmt.Errorf("exporter '%s' has too many fields (%d), maximum allowed is %d", name, len(config), maxConfigFields)
@@ -794,13 +826,13 @@ func validateExporterConfigSecurity(name string, config map[string]interface{}) 
 }
 
 // validateConfigDepthAndTypes recursively validates the depth and types of configuration values.
-func validateConfigDepthAndTypes(obj interface{}, depth int, exporterName string) error {
+func validateConfigDepthAndTypes(obj any, depth int, exporterName string) error {
 	if depth > maxNestingDepth {
 		return fmt.Errorf("exporter '%s' config nesting too deep (max %d levels)", exporterName, maxNestingDepth)
 	}
 
 	switch v := obj.(type) {
-	case map[string]interface{}:
+	case map[string]any:
 		if len(v) > maxConfigFields {
 			return fmt.Errorf("exporter '%s' config object has too many fields at depth %d", exporterName, depth)
 		}
@@ -814,7 +846,7 @@ func validateConfigDepthAndTypes(obj interface{}, depth int, exporterName string
 				return err
 			}
 		}
-	case []interface{}:
+	case []any:
 		if len(v) > maxArrayLength {
 			return fmt.Errorf("exporter '%s' config array too long (%d items) at depth %d", exporterName, len(v), depth)
 		}
@@ -839,7 +871,7 @@ func validateConfigDepthAndTypes(obj interface{}, depth int, exporterName string
 }
 
 // validateExporterSchema validates an exporter config against its schema.
-func validateExporterSchema(exporterName string, config map[string]interface{}) error {
+func validateExporterSchema(exporterName string, config map[string]any) error {
 	exporterType := getExporterType(exporterName)
 	schema, exists := metricsExporterSchemas[exporterType]
 
@@ -854,14 +886,14 @@ func validateExporterSchema(exporterName string, config map[string]interface{}) 
 
 // getExporterType extracts the base exporter type from a name like "otlp/custom".
 func getExporterType(exporterName string) string {
-	if idx := strings.Index(exporterName, "/"); idx != -1 {
-		return exporterName[:idx]
+	if before, _, ok := strings.Cut(exporterName, "/"); ok {
+		return before
 	}
 	return exporterName
 }
 
 // Validate validates an exporter config against the schema.
-func (s ExporterSchema) Validate(exporterName string, config map[string]interface{}) error {
+func (s ExporterSchema) Validate(exporterName string, config map[string]any) error {
 	// Check required fields
 	for _, required := range s.RequiredFields {
 		if _, exists := config[required]; !exists {
@@ -900,7 +932,7 @@ func (s ExporterSchema) Validate(exporterName string, config map[string]interfac
 }
 
 // validateFieldTypeAndConstraints validates field type and applies constraints.
-func validateFieldTypeAndConstraints(exporterName, field string, value interface{}, fieldType FieldType) error {
+func validateFieldTypeAndConstraints(exporterName, field string, value any, fieldType FieldType) error {
 	// Type validation
 	if err := validateFieldTypeStrict(field, value, fieldType.Type); err != nil {
 		return fmt.Errorf("exporter '%s' field '%s': %w", exporterName, field, err)
@@ -930,7 +962,7 @@ func validateFieldTypeAndConstraints(exporterName, field string, value interface
 }
 
 // validateFieldTypeStrict validates field types with enhanced error messages.
-func validateFieldTypeStrict(_ string, value interface{}, expectedType string) error {
+func validateFieldTypeStrict(_ string, value any, expectedType string) error {
 	switch expectedType {
 	case "string":
 		if _, ok := value.(string); !ok {
@@ -948,15 +980,15 @@ func validateFieldTypeStrict(_ string, value interface{}, expectedType string) e
 			return fmt.Errorf("expected bool, got %T", value)
 		}
 	case "object":
-		if _, ok := value.(map[string]interface{}); !ok {
+		if _, ok := value.(map[string]any); !ok {
 			return fmt.Errorf("expected object, got %T", value)
 		}
 	case "array":
-		if _, ok := value.([]interface{}); !ok {
+		if _, ok := value.([]any); !ok {
 			return fmt.Errorf("expected array, got %T", value)
 		}
 	case "map[string]string":
-		if m, ok := value.(map[string]interface{}); ok {
+		if m, ok := value.(map[string]any); ok {
 			for _, v := range m {
 				if _, ok := v.(string); !ok {
 					return fmt.Errorf("map value must be string, got %T", v)
@@ -973,12 +1005,7 @@ func validateFieldTypeStrict(_ string, value interface{}, expectedType string) e
 
 // Helper functions.
 func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(slice, item)
 }
 
 func intPtr(i int) *int {
@@ -1061,7 +1088,7 @@ func syncPrometheusWebTLSCA(ctx context.Context, rr *odhtypes.ReconciliationRequ
 		return fmt.Errorf("failed to set secret type: %w", err)
 	}
 
-	secretData := map[string]interface{}{
+	secretData := map[string]any{
 		"service-ca.crt": caCert,
 	}
 	if err := unstructured.SetNestedMap(secret.Object, secretData, "stringData"); err != nil {

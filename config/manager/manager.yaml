@@ -69,7 +69,7 @@ spec:
         - --leader-elect
         - --operator-name=opendatahub
         # NOTE: image is provided in CI by pullspec substitution, and by make/kustomize for local builds
-        image: REPLACE_IMAGE:latest
+        image: REPLACE_IMAGE:v0.0.0-placeholder
         imagePullPolicy: Always
         name: manager
         ports:
@@ -97,7 +97,7 @@ spec:
         # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
         resources:
           limits:
-            cpu: 500m
+            cpu: 1000m
             memory: 4Gi
           requests:
             cpu: 100m

@@ -14,12 +14,14 @@ spec:
       managementState: "Managed"
       nim:
         managementState: "Managed"
+      wva:
+        managementState: "Removed"
     kueue:
       managementState: "Removed"
     trainingoperator:
-      managementState: "Managed"
-    trainer:
       managementState: "Removed"
+    trainer:
+      managementState: "Managed"
     ray:
       managementState: "Managed"
     workbenches:
@@ -30,6 +32,10 @@ spec:
       managementState: "Managed"
       registriesNamespace: "rhoai-model-registries"
     feastoperator:
-      managementState: "Removed"
+      managementState: "Managed"
     llamastackoperator:
+      managementState: "Removed"
+    mlflowoperator:
+      managementState: "Removed"
+    sparkoperator:
       managementState: "Removed"

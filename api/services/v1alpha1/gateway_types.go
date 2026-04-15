@@ -17,18 +17,32 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"github.com/opendatahub-io/opendatahub-operator/v2/api/common"
-	infrav1 "github.com/opendatahub-io/opendatahub-operator/v2/api/infrastructure/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/opendatahub-io/opendatahub-operator/v2/api/common"
+	infrav1 "github.com/opendatahub-io/opendatahub-operator/v2/api/infrastructure/v1"
 )
 
 const (
 	GatewayServiceName = "gateway"
-	// GatewayInstanceName the name of the GatewayConfig instance singleton.
-	// value should match whats set in the XValidation below
+	// GatewayConfigName is the name of the GatewayConfig instance singleton.
+	// value should match what's set in the XValidation below
 	GatewayConfigName = "default-gateway"
 	GatewayConfigKind = "GatewayConfig"
+)
+
+// IngressMode defines how the Gateway exposes its endpoints externally.
+// +kubebuilder:validation:Enum=OcpRoute;LoadBalancer
+type IngressMode string
+
+const (
+	// IngressModeOcpRoute uses ClusterIP service with standard OpenShift Routes.
+	// This is the default for new deployments and works without additional infrastructure.
+	IngressModeOcpRoute IngressMode = "OcpRoute"
+	// IngressModeLoadBalancer uses a LoadBalancer service type.
+	// This requires a load balancer provider (cloud or MetalLB).
+	IngressModeLoadBalancer IngressMode = "LoadBalancer"
 )
 
 // Check that the component implements common.PlatformObject.
@@ -36,6 +50,12 @@ var _ common.PlatformObject = (*GatewayConfig)(nil)
 
 // GatewayConfigSpec defines the desired state of GatewayConfig
 type GatewayConfigSpec struct {
+	// IngressMode specifies how the Gateway is exposed externally.
+	// "OcpRoute" uses ClusterIP with standard OpenShift Routes (default for new deployments).
+	// "LoadBalancer" uses a LoadBalancer service type (requires cloud or MetalLB).
+	// +optional
+	IngressMode IngressMode `json:"ingressMode,omitempty"`
+
 	// OIDC configuration (used when cluster is in OIDC authentication mode)
 	// +optional
 	OIDC *OIDCConfig `json:"oidc,omitempty"`
@@ -79,6 +99,28 @@ type GatewayConfigSpec struct {
 	// NetworkPolicy configuration for kube-auth-proxy
 	// +optional
 	NetworkPolicy *NetworkPolicyConfig `json:"networkPolicy,omitempty"`
+
+	// ProviderCASecretName is the name of the secret containing the CA certificate for the authentication provider
+	// Used when the OAuth/OIDC provider uses a self-signed or custom CA certificate.
+	// Secret must exist in the openshift-ingress namespace and contain a 'ca.crt' key with the PEM-encoded CA certificate.
+	// +optional
+	ProviderCASecretName string `json:"providerCASecretName,omitempty"`
+
+	// VerifyProviderCertificate controls TLS certificate verification for the authentication provider.
+	// When true (default), certificates are verified against the system trust store and providerCASecretName.
+	// When false, certificate verification is disabled (development/testing only).
+	// WARNING: Setting this to false disables security and should only be used in non-production environments.
+	// For production use with self-signed certificates, use ProviderCASecretName instead.
+	// +optional
+	// +kubebuilder:default=true
+	VerifyProviderCertificate *bool `json:"verifyProviderCertificate,omitempty"`
+
+	// EnableK8sTokenValidation enables Kubernetes service account token validation via TokenReview API.
+	// When enabled, kube-auth-proxy validates bearer tokens as service account tokens alongside OAuth/OIDC authentication.
+	// This allows service accounts to authenticate via bearer tokens while human users authenticate via OAuth/OIDC.
+	// +optional
+	// +kubebuilder:default=true
+	EnableK8sTokenValidation *bool `json:"enableK8sTokenValidation,omitempty"`
 }
 
 // NetworkPolicyConfig defines network policy configuration for kube-auth-proxy.
@@ -114,6 +156,11 @@ type OIDCConfig struct {
 	// Reference to secret containing client secret
 	// +kubebuilder:validation:Required
 	ClientSecretRef corev1.SecretKeySelector `json:"clientSecretRef"`
+
+	// Namespace where the client secret is located
+	// If not specified, defaults to openshift-ingress
+	// +optional
+	SecretNamespace string `json:"secretNamespace,omitempty"`
 }
 
 // CookieConfig defines cookie settings for OAuth2 proxy
@@ -135,6 +182,9 @@ type CookieConfig struct {
 // GatewayConfigStatus defines the observed state of GatewayConfig
 type GatewayConfigStatus struct {
 	common.Status `json:",inline"`
+	// Domain is the computed gateway domain (subdomain + cluster domain or default)
+	// This is the single source of truth for the gateway domain used by all components
+	Domain string `json:"domain,omitempty"`
 }
 
 // +kubebuilder:object:root=true

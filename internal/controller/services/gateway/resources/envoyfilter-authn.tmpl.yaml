@@ -1,13 +1,18 @@
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
-  name: authn-filter
-  namespace: openshift-ingress
+  name: {{.EnvoyFilter}}
+  namespace: {{.GatewayNamespace}}
+  labels:
+    {{.PartOfLabelKey}}: {{.PartOfLabelValue}}
+    {{.ComponentLabelKey}}: {{.ComponentLabelValue}}
+    {{.IstioRevisionLabel}}: {{.IstioRevisionValue}}
 spec:
   workloadSelector:
     labels:
-      gateway.networking.k8s.io/gateway-name: data-science-gateway
+      {{.GatewayNameLabelKey}}: {{.GatewayName}}
   configPatches:
+  # ext_authz for authentication
   - applyTo: HTTP_FILTER
     match:
       context: GATEWAY
@@ -26,22 +31,26 @@ spec:
           transport_api_version: V3
           http_service:
             server_uri:
-              uri: https://kube-auth-proxy.openshift-ingress.svc.cluster.local:8443/oauth2/auth
-              cluster: kube-auth-proxy
-              timeout: %s
+              uri: https://{{.KubeAuthProxyServiceName}}.{{.GatewayNamespace}}.svc.cluster.local:{{.GatewayHTTPSPort}}/oauth2/auth
+              # Use Istio's auto-created EDS cluster for better load balancing across all pods
+              cluster: outbound|{{.GatewayHTTPSPort}}||{{.KubeAuthProxyServiceName}}.{{.GatewayNamespace}}.svc.cluster.local
+              timeout: {{.AuthProxyTimeout}}
             authorization_request:
               allowed_headers:
                 patterns:
                 - exact: cookie
+                - exact: authorization
             authorization_response:
               allowed_upstream_headers:
                 patterns:
                 - exact: x-auth-request-user
                 - exact: x-auth-request-email
                 - exact: x-auth-request-access-token
+                - exact: authorization
               allowed_client_headers:
                 patterns:
                 - exact: set-cookie
+  # Lua for token forwarding after auth
   - applyTo: HTTP_FILTER
     match:
       context: GATEWAY
@@ -54,38 +63,50 @@ spec:
     patch:
       operation: INSERT_BEFORE
       value:
-        name: envoy.lua
+        name: envoy.filters.http.lua
         typed_config:
           "@type": "type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua"
           inline_code: |
             function envoy_on_request(request_handle)
-              -- Extract access token from ext_authz response (set by ext_authz filter after auth)
+              -- Check for authentication success indicators from ext_authz response.
+              -- OAuth mode: x-auth-request-access-token is set (--pass-access-token + --set-xauthrequest)
+              -- OIDC mode: x-auth-request-user is set (--set-xauthrequest), authorization header
+              --   is already set by ext_authz via allowed_upstream_headers (--set-authorization-header)
               local access_token = request_handle:headers():get("x-auth-request-access-token")
-              
-              -- Only process requests that have been authenticated (have auth headers)
-              -- This ensures we don't strip cookies during ext_authz call to auth proxy
-              -- The presence of x-auth-request-access-token indicates authentication succeeded
-              -- and we're now forwarding to upstream services, not to the auth proxy
+              local auth_user = request_handle:headers():get("x-auth-request-user")
+
+              -- OAuth mode: set authorization and forwarded token from access_token
               if access_token then
-                -- Set headers for upstream services
                 request_handle:headers():add("x-forwarded-access-token", access_token)
                 request_handle:headers():replace("authorization", "Bearer " .. access_token)
-                
-                -- Strip OAuth2 proxy cookies only when forwarding to upstream services
-                -- Cookie name is injected at runtime from OAuth2ProxyCookieName constant (gateway_support.go:75)
+              elseif auth_user then
+                -- OIDC mode: authorization header already set by ext_authz (contains id_token)
+                -- Extract token from authorization header for x-forwarded-access-token
+                local auth_header = request_handle:headers():get("authorization")
+                if auth_header then
+                  local token = auth_header:match("^Bearer%s+(.+)")
+                  if token then
+                    request_handle:headers():add("x-forwarded-access-token", token)
+                  end
+                end
+              end
+
+              -- Strip OAuth2 proxy cookies when authenticated (either mode)
+              if access_token or auth_user then
+                -- Cookie name is injected at runtime from AuthProxyCookieName constant (gateway_support.go:59)
                 -- Pattern matches cookies starting with the cookie name, handling variations like:
                 --   - _oauth2_proxy (main cookie)
                 --   - _oauth2_proxy_1, _oauth2_proxy_2 (split cookies if cookie size exceeds limits)
                 local cookie_header = request_handle:headers():get("cookie")
                 if cookie_header then
                   local filtered_cookies = {}
-                  local cookie_pattern = "^{{.CookieName}}"
-                  
+                  local cookie_pattern = "^{{.AuthProxyCookieName}}"
+
                   -- Parse and filter cookies in a single pass
                   for cookie in cookie_header:gmatch("([^;]+)") do
                     -- Trim whitespace and extract cookie name
-                    local trimmed = cookie:match("^%%s*(.-)%%s*$")
-                    if trimmed ~= "" then
+                    local trimmed = cookie:match("^%s*(.-)%s*$")
+                    if trimmed and trimmed ~= "" then
                       local cookie_name = trimmed:match("^([^=]+)")
                       -- Only keep cookies that don't match the OAuth2 proxy cookie pattern
                       if cookie_name and not cookie_name:match(cookie_pattern) then
@@ -93,7 +114,7 @@ spec:
                       end
                     end
                   end
-                  
+
                   -- Update or remove Cookie header based on filtered results
                   if #filtered_cookies > 0 then
                     request_handle:headers():replace("cookie", table.concat(filtered_cookies, "; "))
@@ -102,32 +123,5 @@ spec:
                   end
                 end
               end
-              -- If no auth token present, preserve cookies (needed for ext_authz authentication)
+              -- If no auth indicators present, preserve cookies (needed for ext_authz authentication)
             end
-  - applyTo: CLUSTER
-    match:
-      context: GATEWAY
-    patch:
-      operation: ADD
-      value:
-        name: kube-auth-proxy
-        type: STRICT_DNS
-        connect_timeout: %s
-        transport_socket:
-          name: envoy.transport_sockets.tls
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-            common_tls_context:
-              validation_context:
-                trusted_ca:
-                  filename: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
-            sni: kube-auth-proxy.openshift-ingress.svc.cluster.local
-        load_assignment:
-          cluster_name: kube-auth-proxy
-          endpoints:
-          - lb_endpoints:
-            - endpoint:
-                address:
-                  socket_address:
-                    address: kube-auth-proxy.openshift-ingress.svc.cluster.local
-                    port_value: 8443

@@ -5,6 +5,7 @@ metadata:
   namespace: {{.GatewayNamespace}}
   labels:
     app: {{.KubeAuthProxyServiceName}}
+    {{.ComponentLabelKey}}: {{.ComponentLabelValue}}
 spec:
   replicas: 2
   selector:
@@ -14,9 +15,11 @@ spec:
     metadata:
       labels:
         app: {{.KubeAuthProxyServiceName}}
+        {{.ComponentLabelKey}}: {{.ComponentLabelValue}}
       annotations:
         opendatahub.io/secret-hash: "{{.AuthConfigHash}}"
     spec:
+      serviceAccountName: {{.KubeAuthProxyServiceName}}
       securityContext:
         runAsNonRoot: true
         seccompProfile:
@@ -29,6 +32,11 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 10Mi
+        {{- if .ProviderCASecret }}
+        - name: provider-ca-cert
+          secret:
+            secretName: {{.ProviderCASecretName}}
+        {{- end }}
       containers:
         - name: {{.KubeAuthProxyServiceName}}
           image: {{.KubeAuthProxyImage}}
@@ -63,13 +71,17 @@ spec:
               mountPath: {{.TLSCertsMountPath}}
             - name: tmp
               mountPath: /tmp
+            {{- if .ProviderCASecret }}
+            - name: provider-ca-cert
+              readOnly: true
+              mountPath: /etc/provider-ca
+            {{- end }}
           resources:
             requests:
-              cpu: "10m"
-              memory: "32Mi"
+              cpu: "500m"
+              memory: "128Mi"
             limits:
-              cpu: "50m"
-              memory: "64Mi"
+              memory: "128Mi"
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -84,12 +96,17 @@ spec:
             - "--upstream=static://200"
             - "--skip-provider-button"
             - "--skip-jwt-bearer-tokens=true"
-            - "--pass-access-token=true"
+            - "--pass-authorization-header=true"
+            - "--set-authorization-header=true"
             - "--set-xauthrequest=true"
+            - "--enable-k8s-token-validation={{.EnableK8sTokenValidation}}"
             - "--redirect-url={{.RedirectURL}}"
             - "--tls-cert-file={{.TLSCertsMountPath}}/tls.crt"
             - "--tls-key-file={{.TLSCertsMountPath}}/tls.key"
             - "--use-system-trust-store=true"
+            {{- if .ProviderCASecret }}
+            - "--provider-ca-file=/etc/provider-ca/ca.crt"
+            {{- end }}
             - "--cookie-expire={{.CookieExpire}}"
             - "--cookie-refresh={{.CookieRefresh}}"
             - "--cookie-secure=true"
@@ -100,4 +117,4 @@ spec:
             - "--provider=oidc"
             - "--oidc-issuer-url={{.OIDCIssuerURL}}"
             - "--skip-oidc-discovery=false"
-            - "--ssl-insecure-skip-verify=false" # TODO: need to check if this is correct to hardcode skip verify.
+            - "--ssl-insecure-skip-verify={{.InsecureSkipVerify}}"
