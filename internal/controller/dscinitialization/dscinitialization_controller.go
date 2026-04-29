@@ -69,6 +69,13 @@ type DSCInitializationReconciler struct {
 	OperatorSettings operatorconfig.OperatorSettings
 }
 
+type DSCInitializationCondition struct {
+	Type         string
+	ReadyReason  string
+	ReadyMessage string
+	ReadyStatus  metav1.ConditionStatus
+}
+
 // Reconcile contains controller logic specific to DSCInitialization instance updates.
 func (r *DSCInitializationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) { //nolint:funlen,maintidx,gocyclo
 	log := logf.FromContext(ctx).WithName("DSCInitialization")
@@ -252,8 +259,12 @@ func (r *DSCInitializationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	// Finish reconciling
+	monitoringConditions := r.getMonitoringReadyCondition(ctx)
 	_, err = status.UpdateWithRetry(ctx, r.Client, instance, func(saved *dsciv2.DSCInitialization) {
 		status.SetCompleteCondition(&saved.Status.Conditions, status.ReconcileCompleted, status.ReconcileCompletedMessage)
+		for _, c := range monitoringConditions {
+			status.SetCondition(&saved.Status.Conditions, c.Type, c.ReadyReason, c.ReadyMessage, c.ReadyStatus)
+		}
 		saved.Status.Phase = status.PhaseReady
 	})
 	if err != nil {
@@ -334,6 +345,10 @@ func (r *DSCInitializationReconciler) SetupWithManager(ctx context.Context, mgr 
 			getObject(gvk.GatewayConfig),
 			handler.EnqueueRequestsFromMapFunc(r.watchGatewayConfigResource),
 		).
+		Watches(
+			getObject(gvk.Monitoring),
+			handler.EnqueueRequestsFromMapFunc(r.watchMonitoringResource),
+		).
 		Watches( // TODO: this might not be needed after v3.3.
 			getObject(gvk.CustomResourceDefinition),
 			handler.EnqueueRequestsFromMapFunc(r.watchHWProfileCRDResource),
@@ -377,6 +392,88 @@ func (r *DSCInitializationReconciler) watchGatewayConfigResource(ctx context.Con
 	}
 
 	return nil
+}
+
+func (r *DSCInitializationReconciler) watchMonitoringResource(ctx context.Context, _ client.Object) []reconcile.Request {
+	log := logf.FromContext(ctx)
+	instanceList := &serviceApi.MonitoringList{}
+	if err := r.Client.List(ctx, instanceList); err != nil {
+		log.Error(err, "failed to get MonitoringList")
+		return nil
+	}
+	if len(instanceList.Items) == 0 {
+		log.Info("Found no Monitoring instance in cluster, reconciling to recreate one")
+		return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: serviceApi.MonitoringInstanceName}}}
+	}
+
+	// Monitoring CR exists — trigger DSCI reconciliation so it can propagate
+	// the latest Monitoring status conditions into its own status.
+	dsciList := &dsciv2.DSCInitializationList{}
+	if err := r.Client.List(ctx, dsciList); err != nil {
+		log.Error(err, "Failed to get DSCInitializationList")
+		return nil
+	}
+	if len(dsciList.Items) == 0 {
+		return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: "default-dsci"}}}
+	}
+
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: dsciList.Items[0].Name}}}
+}
+
+func (r *DSCInitializationReconciler) getMonitoringReadyCondition(ctx context.Context) []DSCInitializationCondition {
+	monitoring := &serviceApi.Monitoring{}
+	err := r.Client.Get(ctx, client.ObjectKey{Name: serviceApi.MonitoringInstanceName}, monitoring)
+	if err != nil {
+		if k8serr.IsNotFound(err) {
+			return []DSCInitializationCondition{{status.ConditionMonitoringReady, status.RemovedReason, "Monitoring is not enabled", metav1.ConditionFalse}}
+		}
+		return []DSCInitializationCondition{{status.ConditionMonitoringReady, status.NotReadyReason,
+			fmt.Sprintf("Failed to retrieve Monitoring CR status: %v", err), metav1.ConditionUnknown}}
+	}
+
+	monitoringConditions := monitoring.GetConditions()
+	conditions := make([]DSCInitializationCondition, 0, len(monitoringConditions)+1)
+
+	isDegraded := false
+	degradedReason := status.ReadyReason
+	degradedMessage := ""
+
+	// we add all the conditions from the Monitoring CR to the list to be returned later
+	// the negative condition is appended to the degraded message to be shown later in the aggregate condition
+	// in case any negative condition shows up
+	for _, c := range monitoringConditions {
+		conditions = append(conditions, DSCInitializationCondition{
+			Type:         c.Type,
+			ReadyReason:  c.Reason,
+			ReadyMessage: c.Message,
+			ReadyStatus:  c.Status,
+		})
+		if c.Type == status.ConditionTypeReady && c.Status == metav1.ConditionFalse {
+			isDegraded = true
+			degradedReason = c.Reason
+			degradedMessage += c.Message + "\n"
+		}
+	}
+
+	if len(conditions) == 0 {
+		return []DSCInitializationCondition{{status.ConditionMonitoringReady, status.NotReadyReason, "Monitoring stack is initializing", metav1.ConditionUnknown}}
+	}
+
+	// Add aggregate MonitoringReady condition with all the messages
+	monitoringReadyStatus := metav1.ConditionTrue
+	if isDegraded {
+		monitoringReadyStatus = metav1.ConditionFalse
+	} else {
+		degradedMessage = "Monitoring stack is ready"
+	}
+	conditions = append(conditions, DSCInitializationCondition{
+		Type:         status.ConditionMonitoringReady,
+		ReadyReason:  degradedReason,
+		ReadyMessage: degradedMessage,
+		ReadyStatus:  monitoringReadyStatus,
+	})
+
+	return conditions
 }
 
 func (r *DSCInitializationReconciler) deleteMonitoringCR(ctx context.Context) error {
